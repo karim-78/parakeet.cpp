@@ -144,6 +144,265 @@ def _squeeze(arr):
     return np.ascontiguousarray(out)
 
 
+def _get_md_flag(m, key):
+    """Read a model_defaults entry (OmegaConf dict or attr access)."""
+    md = getattr(m.cfg, "model_defaults", {}) or {}
+    try:
+        return md[key]
+    except Exception:
+        return getattr(md, key, None)
+
+
+def _prompt_streaming_text(m, feats, feat_len, pidx, num_prompts, specials):
+    """NeMo cache-aware *streaming* transcript for a prompt model, with the
+    language prompt applied (the authoritative streaming target for the C++
+    StreamingSession).
+
+    Mirrors ``gen_stream_baseline.py`` for the encoder side, then applies the
+    SAME prompt branch as the offline forward (transpose -> cat(onehot) ->
+    prompt_kernel -> transpose) to the concatenated streamed encoder output, and
+    decodes the whole prompt-conditioned streamed output in one shot (the
+    cache-aware-equivalence property makes single-shot decode of the streamed
+    output == per-chunk decode carrying state, which is what the C++ session does).
+
+    Returns (stream_text, stream_token_ids[list]). Returns (None, None) when the
+    encoder is not a cache-aware streaming encoder (so the caller can skip the KV).
+    """
+    import torch
+
+    enc = m.encoder
+    if not hasattr(enc, "cache_aware_stream_step"):
+        return None, None
+    from nemo.collections.asr.parts.utils.streaming_utils import (
+        CacheAwareStreamingAudioBuffer,
+    )
+
+    enc.setup_streaming_params()
+    sc = enc.streaming_cfg
+
+    sb = CacheAwareStreamingAudioBuffer(
+        model=m, online_normalization=False, pad_and_drop_preencoded=False
+    )
+    sb.append_processed_signal(feats, stream_id=-1)
+    sb_iter = iter(sb)
+    cache_last_channel, cache_last_time, cache_last_channel_len = (
+        enc.get_initial_cache_state(batch_size=1)
+    )
+
+    outs = []
+    for step_num, (chunk_audio, chunk_lengths) in enumerate(sb_iter):
+        drop = sc.drop_extra_pre_encoded if step_num != 0 else 0
+        keep_all = sb.is_buffer_empty()
+        with torch.no_grad():
+            (e, el, cache_last_channel, cache_last_time, cache_last_channel_len) = (
+                enc.cache_aware_stream_step(
+                    processed_signal=chunk_audio,
+                    processed_signal_length=chunk_lengths,
+                    cache_last_channel=cache_last_channel,
+                    cache_last_time=cache_last_time,
+                    cache_last_channel_len=cache_last_channel_len,
+                    keep_all_outputs=keep_all,
+                    drop_extra_pre_encoded=drop,
+                )
+            )
+        valid = int(el[0].item())
+        outs.append(e[:, :, :valid].detach())  # [1, d_model, valid]
+
+    stream_enc = torch.cat(outs, dim=2)  # [1, d_model, T']
+    Tp = stream_enc.shape[2]
+    stream_len = torch.tensor([Tp], dtype=torch.int64)
+
+    # Apply the language prompt to the streamed encoder output (same branch as
+    # the offline forward; one-hot constant over time).
+    with torch.no_grad():
+        encoded = stream_enc.transpose(1, 2)                      # [1, T', D]
+        onehot = torch.zeros(1, Tp, num_prompts, dtype=encoded.dtype)
+        onehot[:, :, pidx] = 1.0
+        concat = torch.cat([encoded, onehot], dim=-1)             # [1, T', D+P]
+        pk_out = m.prompt_kernel(concat)                          # [1, T', D]
+        pk_enc = pk_out.transpose(1, 2).contiguous()             # [1, D, T']
+        hyps = m.decoding.rnnt_decoder_predictions_tensor(
+            encoder_output=pk_enc, encoded_lengths=stream_len, return_hypotheses=True
+        )
+    first = hyps[0] if isinstance(hyps, list) else hyps
+    if isinstance(first, list):
+        first = first[0]
+    ys = first.y_sequence
+    ys = ys.cpu().tolist() if hasattr(ys, "cpu") else list(ys)
+    stream_ids = [int(t) for t in ys]
+    non_special = [t for t in stream_ids if t not in specials]
+    stream_text = m.tokenizer.ids_to_text(non_special)
+    return stream_text, stream_ids
+
+
+def resolve_prompt_lang(m, lang=None):
+    """Resolve (target_lang, prompt_index, num_prompts) for a prompt model.
+
+    ``lang`` None/empty -> the model default ("auto" if present, else the first
+    dictionary key). Exits(1) with PARAKEET_BASELINE_BAD_LANG on an unknown key.
+    """
+    md = m.cfg.model_defaults
+    pdict = md.prompt_dictionary
+    num_prompts = int(md.get("num_prompts", 128))
+    default_lang = "auto" if "auto" in pdict else list(pdict.keys())[0]
+    target_lang = lang or default_lang
+    if target_lang not in pdict:
+        keys = list(pdict.keys())
+        print(
+            f"PARAKEET_BASELINE_BAD_LANG: '{target_lang}' not in prompt_dictionary; "
+            f"available (first 10): {keys[:10]}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return target_lang, int(pdict[target_lang]), num_prompts
+
+
+def compute_prompt_reference(m, audio_path, lang=None):
+    """NeMo reference for a prompt-conditioned (nemotron) model at target ``lang``.
+
+    Runs the SAME prompt branch as NeMo's forward() (encoder -> transpose ->
+    cat(onehot) -> prompt_kernel -> transpose) and decodes the prompt-conditioned
+    encoder output via ``m.decoding.rnnt_decoder_predictions_tensor`` for BOTH the
+    offline encoder pass and the cache-aware streaming pass. This is the
+    authoritative path used by every Phase 2/3 baseline (the lhotse
+    transcribe(target_lang=...) dataloader needs per-cut language metadata our bare
+    wav fixtures lack).
+
+    Returns a dict with: target_lang, prompt_index, num_prompts, encoder_out
+    (np [D,T]), prompt_kernel_out (np [T,D]), rnnt_ids (np int32), rnnt_text,
+    stream_text (str|None), stream_ids (list[int]|None).
+    """
+    import torch
+    import soundfile as sf
+
+    target_lang, pidx, num_prompts = resolve_prompt_lang(m, lang)
+
+    wav, sr = sf.read(audio_path, dtype="float32", always_2d=False)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    if sr != 16000:
+        print(f"PARAKEET_BASELINE_BAD_AUDIO: expected 16k mono, got sr={sr}",
+              file=sys.stderr)
+        sys.exit(1)
+    wt = torch.from_numpy(np.ascontiguousarray(wav)).float().unsqueeze(0)  # [1, S]
+    lt = torch.tensor([wt.shape[1]], dtype=torch.int64)
+
+    with torch.no_grad():
+        feats, flen = m.preprocessor(input_signal=wt, length=lt)
+        enc, elen = m.encoder(audio_signal=feats, length=flen)  # [1, D, T]
+        encoded = enc.transpose(1, 2)                            # [1, T, D]
+        T = encoded.shape[1]
+        onehot = torch.zeros(1, T, num_prompts, dtype=encoded.dtype)
+        onehot[:, :, pidx] = 1.0
+        concat = torch.cat([encoded, onehot], dim=-1)            # [1, T, D+P]
+        pk_out = m.prompt_kernel(concat)                         # [1, T, D]
+
+    # RNNT greedy reference for this language. We CANNOT use m.transcribe() here:
+    # the prompt model's transcribe dataloader (LhotseSpeechToTextBpeDatasetWith
+    # PromptIndex) resolves the prompt index from each cut's language metadata,
+    # which our bare wav fixture lacks ("Unknown prompt key: 'None'"). Instead we
+    # decode the prompt-conditioned encoder output DIRECTLY via the model's RNNT
+    # decoding object — exactly what _transcribe_output_processing does, and the
+    # same encoder-output the C++ engine feeds its rnnt_greedy after PromptKernel.
+    pk_enc = pk_out.transpose(1, 2).contiguous()                 # [1, D, T] for decoding
+    with torch.no_grad():
+        hyps = m.decoding.rnnt_decoder_predictions_tensor(
+            encoder_output=pk_enc, encoded_lengths=elen, return_hypotheses=True
+        )
+    first = hyps[0] if isinstance(hyps, list) else hyps
+    if isinstance(first, list):  # NBest -> take the top hypothesis
+        first = first[0]
+    ys = first.y_sequence
+    ys = ys.cpu().tolist() if hasattr(ys, "cpu") else list(ys)
+    rnnt_ids = np.array(list(ys), dtype=np.int32)
+    rnnt_text = first.text if hasattr(first, "text") else str(first)
+
+    # Resolve <EOU>/<EOB> special ids (if any) so the streaming transcript strips
+    # them exactly as StreamingSession does (specials surface as events, not text).
+    specials = set()
+    for tok in ("<EOU>", "<EOB>"):
+        try:
+            ids = m.tokenizer.tokens_to_ids([tok])
+            if ids and int(ids[0]) >= 0:
+                specials.add(int(ids[0]))
+        except Exception:
+            pass
+
+    # Cache-aware STREAMING transcript WITH the language prompt — the authoritative
+    # target for the C++ StreamingSession. None if the model isn't a streaming
+    # (cache-aware) encoder.
+    stream_text, stream_ids = _prompt_streaming_text(
+        m, feats, flen, pidx, num_prompts, specials
+    )
+
+    return {
+        "target_lang": target_lang,
+        "prompt_index": pidx,
+        "num_prompts": num_prompts,
+        "encoder_out": _squeeze(enc.cpu().float().numpy()),          # [D, T]
+        "prompt_kernel_out": _squeeze(pk_out.cpu().float().numpy()),  # [T, D]
+        "rnnt_ids": rnnt_ids,
+        "rnnt_text": rnnt_text,
+        "stream_text": stream_text,
+        "stream_ids": stream_ids,
+    }
+
+
+def dump_prompt_baseline(m, args):
+    """Dump the prompt-model baseline for a fixed target_lang:
+
+      * ``encoder_out``       ``[D, T]``  RAW encoder output (BEFORE prompt).
+      * ``prompt_kernel_out`` ``[T, D]``  prompt_kernel(cat([encoded, onehot])),
+                                          i.e. NeMo's forward() prompt branch.
+      * ``rnnt_token_ids``    ``[L]`` int32  NeMo RNNT greedy ids for this lang.
+      * KVs: baseline.target_lang, baseline.prompt_index,
+             baseline.rnnt_token_count, baseline.rnnt_text,
+             baseline.stream_text (cache-aware streaming transcript WITH prompt,
+             EOU/EOB stripped — the authoritative target for StreamingSession).
+
+    Mirrors NeMo EncDecRNNTBPEModelWithPrompt.forward():
+      encoded(B,D,T) -> transpose -> cat(onehot) -> prompt_kernel -> transpose.
+    The one-hot is constant over time (one language per utterance).
+    """
+    ref = compute_prompt_reference(m, args.audio, args.lang)
+    target_lang = ref["target_lang"]
+    pidx = ref["prompt_index"]
+    num_prompts = ref["num_prompts"]
+    rnnt_ids = ref["rnnt_ids"]
+    rnnt_text = ref["rnnt_text"]
+    stream_text = ref["stream_text"]
+    stream_ids = ref["stream_ids"]
+
+    w = gguf.GGUFWriter(args.output, "parakeet-baseline-prompt")
+    w.add_string("baseline.target_lang", target_lang)
+    w.add_uint32("baseline.prompt_index", pidx)
+    w.add_uint32("baseline.num_prompts", num_prompts)
+    w.add_tensor("encoder_out", ref["encoder_out"])           # [D, T]
+    w.add_tensor("prompt_kernel_out", ref["prompt_kernel_out"])  # [T, D]
+    w.add_uint32("baseline.rnnt_token_count", int(rnnt_ids.shape[0]))
+    if rnnt_ids.shape[0] > 0:
+        w.add_tensor("rnnt_token_ids", np.ascontiguousarray(rnnt_ids))
+    w.add_string("baseline.rnnt_text", rnnt_text)
+    if stream_text is not None:
+        w.add_string("baseline.stream_text", stream_text)
+        sids = np.array(stream_ids, dtype=np.int32)
+        w.add_uint32("baseline.stream_token_count", int(sids.shape[0]))
+        if sids.shape[0] > 0:
+            w.add_tensor("stream_token_ids", np.ascontiguousarray(sids))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    print(
+        f"wrote {args.output}: prompt baseline lang={target_lang} idx={pidx} "
+        f"tokens={rnnt_ids.shape[0]} text={rnnt_text!r}"
+    )
+    if stream_text is not None:
+        print(f"  baseline.stream_text={stream_text!r} (stream_tokens={len(stream_ids)})")
+    else:
+        print("  baseline.stream_text: SKIPPED (encoder is not cache-aware streaming)")
+
+
 def _timestamps_decoding_cfg(m):
     """Build a decoding cfg (cloned from the model's own) that turns on
     per-frame/token/word confidence using the reproducible ``max_prob`` method.
@@ -446,6 +705,11 @@ def main():
         "transcripts reflect banded local attention. Anchors the C++ "
         "banded-attention parity tests at NeMo quality.",
     )
+    ap.add_argument(
+        "--lang",
+        default=None,
+        help="target_lang for prompt models (default: model default / auto)",
+    )
     args = ap.parse_args()
 
     is_local = pathlib.Path(args.model).exists()
@@ -483,6 +747,17 @@ def main():
     # baseline behaviour below is completely untouched.
     if args.timestamps:
         _run_timestamps(m, args)
+        return
+
+    # Prompt-conditioned multilingual model (nemotron, EncDecRNNTBPEModelWithPrompt):
+    # dump the raw encoder output, the prompt_kernel projection, and the per-language
+    # RNNT greedy reference. Kept as a separate early path; the encoder-stage hook
+    # baseline below is for the hybrid / pure-RNNT models and is untouched.
+    has_prompt = bool(_get_md_flag(m, "initialize_prompt_feature")) and (
+        getattr(m, "prompt_kernel", None) is not None
+    )
+    if has_prompt:
+        dump_prompt_baseline(m, args)
         return
 
     # Per-layer / module captures via forward hooks. The preprocessor and
